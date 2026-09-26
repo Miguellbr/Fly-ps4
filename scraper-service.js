@@ -20,6 +20,7 @@ const chromiumPromise = import('@sparticuz/chromium');
 const stealth = StealthPlugin();
 puppeteerExtra.use(stealth);
 
+
 // CUSTOM STEALTH CONFIGURATION
 // Espaço reservado para configurações adicionais.
 
