@@ -25,13 +25,14 @@ puppeteerExtra.use(StealthPlugin());
 const API_KEY = process.env.API_KEY || 'dev-key';
 const PORT = Number(process.env.PORT) || 8080;
 const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
-const CACHE_LOGIC_VERSION = 'v3'; // bump when extraction/resolve rules change
+const CACHE_LOGIC_VERSION = 'v4'; // v4: embedded is candidate only; browser must confirm
 const PAGE_GOTO_TIMEOUT_MS = 30000;
 const RESOLVE_GOTO_TIMEOUT_MS = 15000;
 const POST_LOAD_WAIT_MS = 2000;
-const POST_RESOLVE_WAIT_MS = 1200;
+const POST_RESOLVE_WAIT_MS = 1500;
 const MAX_CANDIDATES = 60;
 const MAX_BODY_BYTES = 32 * 1024;
+const MAX_RESOLVE_HOPS = 5;
 
 // Central host lists (used by extraction AND resolution — never diverge)
 const DOWNLOAD_HOST_HINTS = Object.freeze([
@@ -60,7 +61,10 @@ const INTERMEDIATE_HOSTS = Object.freeze([
   'ouo.io',
   'adf.ly',
   'bit.ly',
-  'cutt.ly'
+  'cutt.ly',
+  'clk.sh',
+  'clks.pro',
+  'short.ink'
 ]);
 
 // Central regexes
@@ -199,85 +203,176 @@ function tryDecodeEmbeddedUrl(rawUrl) {
 }
 
 /**
- * Resolve intermediate → validated final URL.
- * Never sets success=true without validateResolvedUrl.
+ * Navigate once with Puppeteer and report the browser-confirmed URL + redirect chain.
+ * Does not validate — caller decides success.
  */
-async function resolveLink(page, originalHref, sourcePageUrl, reqId) {
-  const originalHost = hostOf(originalHref);
-
-  // Already a known final host
-  if (isKnownFinalHost(originalHost)) {
-    const v = validateResolvedUrl(originalHref, originalHref, sourcePageUrl);
-    if (v.valid) {
-      log(reqId, 'RESOLVE', `final accepted (direct) ${v.host}`);
-      return { success: true, url: v.url, host: v.host, method: 'direct' };
-    }
-    log(reqId, 'RESOLVE', `direct rejected: ${v.reason}`);
-    return { success: false, url: null, host: v.host, error: v.reason, method: 'direct' };
-  }
-
-  // Embedded candidate
-  const embedded = tryDecodeEmbeddedUrl(originalHref);
-  if (embedded) {
-    log(reqId, 'RESOLVE', `embedded candidate: ${originalHost} → ${hostOf(embedded)} ${embedded.slice(0, 90)}`);
-    const v = validateResolvedUrl(embedded, originalHref, sourcePageUrl);
-    if (v.valid) {
-      log(reqId, 'RESOLVE', `final accepted (embedded) ${v.host}`);
-      return { success: true, url: v.url, host: v.host, method: 'embedded' };
-    }
-    log(reqId, 'RESOLVE', `embedded rejected: ${v.reason}`);
-    // fall through to navigate if intermediate, else fail
-  }
-
-  // Unknown non-intermediate host: do not claim success
-  if (!isIntermediateHost(originalHost)) {
-    log(reqId, 'RESOLVE', `passthrough rejected: unknown host ${originalHost}`);
-    return {
-      success: false,
-      url: null,
-      host: originalHost,
-      error: 'Host não reconhecido como destino final',
-      method: 'passthrough'
-    };
-  }
-
-  // Navigate intermediate (HTTP redirects only — no CAPTCHA/paywall bypass)
+async function navigateOnce(page, targetUrl, reqId) {
+  log(reqId, 'RESOLVE', `navigation → ${String(targetUrl).slice(0, 120)}`);
   try {
-    log(reqId, 'RESOLVE', `navigating: ${originalHref.slice(0, 100)}`);
-    const response = await page.goto(originalHref, {
+    const response = await page.goto(targetUrl, {
       waitUntil: 'domcontentloaded',
       timeout: RESOLVE_GOTO_TIMEOUT_MS
     });
+    // Allow soft redirects / History API updates after load
     await new Promise((r) => setTimeout(r, POST_RESOLVE_WAIT_MS));
 
-    const finalUrl = page.url() || originalHref;
+    const currentUrl = page.url() || targetUrl;
     const status = response?.status?.() ?? null;
-    const v = validateResolvedUrl(finalUrl, originalHref, sourcePageUrl);
 
-    if (!v.valid) {
-      log(reqId, 'RESOLVE', `navigated rejected: ${v.reason} host=${v.host || hostOf(finalUrl)}`);
+    let redirectChain = [];
+    try {
+      const req = response?.request?.();
+      const chain = req?.redirectChain?.() || [];
+      redirectChain = chain.map((r) => r.url()).filter(Boolean);
+      if (currentUrl && !redirectChain.includes(currentUrl)) {
+        redirectChain = [...redirectChain, currentUrl];
+      }
+    } catch {
+      redirectChain = [currentUrl];
+    }
+
+    log(reqId, 'RESOLVE', `current URL: ${String(currentUrl).slice(0, 120)}`);
+    if (redirectChain.length) {
+      log(
+        reqId,
+        'RESOLVE',
+        `redirect chain: ${redirectChain.map((u) => hostOf(u) || u.slice(0, 40)).join(' → ')}`
+      );
+    }
+
+    return { ok: true, url: currentUrl, host: hostOf(currentUrl), status, redirectChain, error: null };
+  } catch (err) {
+    log(reqId, 'RESOLVE', `navigation error: ${err.message}`);
+    return {
+      ok: false,
+      url: null,
+      host: null,
+      status: null,
+      redirectChain: [],
+      error: err.message || 'Falha ao navegar'
+    };
+  }
+}
+
+/**
+ * Resolve intermediate → browser-confirmed final URL.
+ *
+ * originalUrl  = href from HTML
+ * candidateUrl = URL found inside intermediate (e.g. base64 param) — NOT final by itself
+ * resolvedUrl  = page.url() after navigation — only this may become success:true after validation
+ *
+ * Chain: A → B → C → DEST (max MAX_RESOLVE_HOPS), with loop protection.
+ * Never sets success=true from parse alone.
+ */
+async function resolveLink(page, originalHref, sourcePageUrl, reqId) {
+  log(reqId, 'RESOLVE', `original URL: ${String(originalHref).slice(0, 120)}`);
+
+  const originalHost = hostOf(originalHref);
+
+  // Direct final host already in the HTML — no intermediate to bypass
+  if (isKnownFinalHost(originalHost)) {
+    const v = validateResolvedUrl(originalHref, originalHref, sourcePageUrl);
+    log(reqId, 'RESOLVE', `final validation (direct): ${v.reason}`);
+    if (v.valid) {
+      log(reqId, 'RESOLVE', `accepted (direct) ${v.host}`);
+      return { success: true, url: v.url, host: v.host, method: 'direct' };
+    }
+    log(reqId, 'RESOLVE', `rejected: ${v.reason}`);
+    return { success: false, url: null, host: v.host, error: v.reason, method: 'direct' };
+  }
+
+  // Candidate from query/base64 — input to the resolver, never auto-success
+  const embeddedCandidate = tryDecodeEmbeddedUrl(originalHref);
+  if (embeddedCandidate) {
+    log(
+      reqId,
+      'RESOLVE',
+      `embedded candidate: ${hostOf(embeddedCandidate)} ${embeddedCandidate.slice(0, 100)}`
+    );
+  }
+
+  // Build hop queue: start at original intermediate; then candidate if any
+  const queue = [];
+  const visited = new Set();
+  const enqueue = (u) => {
+    if (!u || !isHttpUrl(u)) return;
+    const key = u.split('#')[0];
+    if (visited.has(key) || queue.some((q) => q.split('#')[0] === key)) return;
+    queue.push(u);
+  };
+
+  enqueue(originalHref);
+  if (embeddedCandidate) enqueue(embeddedCandidate);
+
+  let lastError = 'Não foi possível resolver o destino';
+  let lastHost = originalHost;
+  let hops = 0;
+
+  while (queue.length > 0 && hops < MAX_RESOLVE_HOPS) {
+    const nextUrl = queue.shift();
+    const key = nextUrl.split('#')[0];
+    if (visited.has(key)) continue;
+    visited.add(key);
+    hops++;
+
+    log(reqId, 'RESOLVE', `attempting hop ${hops}/${MAX_RESOLVE_HOPS}: ${hostOf(nextUrl)}`);
+
+    // If this hop target is already a known final host, still confirm via browser
+    const nav = await navigateOnce(page, nextUrl, reqId);
+    if (!nav.ok) {
+      lastError = nav.error || 'Falha de navegação';
+      continue;
+    }
+
+    lastHost = nav.host;
+
+    log(reqId, 'RESOLVE', `final validation: ${nav.url.slice(0, 120)}`);
+    const v = validateResolvedUrl(nav.url, originalHref, sourcePageUrl);
+    if (v.valid) {
+      log(reqId, 'RESOLVE', `accepted (navigate) ${v.host} hops=${hops}`);
       return {
-        success: false,
-        url: null,
-        host: v.host || hostOf(finalUrl),
-        error: v.reason,
-        method: 'navigate',
-        status
+        success: true,
+        url: v.url,
+        host: v.host,
+        method: hops === 1 && !embeddedCandidate ? 'navigate' : 'navigate-chain',
+        status: nav.status,
+        hops
       };
     }
 
-    log(reqId, 'RESOLVE', `final accepted (navigate) ${v.host}`);
-    return { success: true, url: v.url, host: v.host, method: 'navigate', status };
-  } catch (err) {
-    log(reqId, 'RESOLVE', `nav error: ${err.message}`);
-    return {
-      success: false,
-      url: null,
-      host: null,
-      error: err.message || 'Falha ao navegar na URL intermediária',
-      method: 'navigate'
-    };
+    log(reqId, 'RESOLVE', `rejected: ${v.reason}`);
+    lastError = v.reason;
+
+    // Continue chain: embedded on the *confirmed* URL, then on the hop we requested
+    const fromConfirmed = tryDecodeEmbeddedUrl(nav.url);
+    if (fromConfirmed) {
+      log(reqId, 'RESOLVE', `embedded candidate (from current): ${hostOf(fromConfirmed)}`);
+      enqueue(fromConfirmed);
+    }
+    const fromHop = tryDecodeEmbeddedUrl(nextUrl);
+    if (fromHop && fromHop !== fromConfirmed) {
+      enqueue(fromHop);
+    }
+
+    // If browser landed on another intermediate, follow that URL next
+    if (isIntermediateHost(nav.host) && nav.url) {
+      enqueue(nav.url);
+    }
   }
+
+  if (hops >= MAX_RESOLVE_HOPS) {
+    lastError = `Limite de ${MAX_RESOLVE_HOPS} hops atingido`;
+  }
+
+  log(reqId, 'RESOLVE', `rejected: ${lastError}`);
+  return {
+    success: false,
+    url: null,
+    host: lastHost,
+    error: lastError,
+    method: 'navigate-chain',
+    hops
+  };
 }
 
 // ---------------------------------------------------------------------------
