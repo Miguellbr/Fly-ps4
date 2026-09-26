@@ -1,3 +1,16 @@
+/**
+ * PS4 Scraper Service (Fly.io)
+ * Single source of truth for: page load, structural extraction, classification, URL validation/resolution.
+ *
+ * API:
+ *   GET  /         status
+ *   GET  /health   health + uptime
+ *   POST /scrape   { url, titleId?, gameName? }  header x-api-key
+ */
+
+'use strict';
+
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const puppeteerExtra = require('puppeteer-extra');
@@ -6,18 +19,22 @@ const chromiumPromise = import('@sparticuz/chromium');
 
 puppeteerExtra.use(StealthPlugin());
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
 const API_KEY = process.env.API_KEY || 'dev-key';
-const PORT = process.env.PORT || 8080;
+const PORT = Number(process.env.PORT) || 8080;
+const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
+const CACHE_LOGIC_VERSION = 'v3'; // bump when extraction/resolve rules change
+const PAGE_GOTO_TIMEOUT_MS = 30000;
+const RESOLVE_GOTO_TIMEOUT_MS = 15000;
+const POST_LOAD_WAIT_MS = 2000;
+const POST_RESOLVE_WAIT_MS = 1200;
+const MAX_CANDIDATES = 60;
+const MAX_BODY_BYTES = 32 * 1024;
 
-// Cache em memória
-const cache = new Map();
-const CACHE_TTL = 1000 * 60 * 60; // 1 hora
-
-const DOWNLOAD_HOST_HINTS = [
+// Central host lists (used by extraction AND resolution — never diverge)
+const DOWNLOAD_HOST_HINTS = Object.freeze([
   'mediafire',
   '1fichier',
   'mega.nz',
@@ -34,9 +51,9 @@ const DOWNLOAD_HOST_HINTS = [
   'akirabox',
   'vikingfile',
   'workupload'
-];
+]);
 
-const INTERMEDIATE_HOSTS = [
+const INTERMEDIATE_HOSTS = Object.freeze([
   'shrinkearn.com',
   'shrinkme.io',
   'linkvertise.com',
@@ -44,68 +61,35 @@ const INTERMEDIATE_HOSTS = [
   'adf.ly',
   'bit.ly',
   'cutt.ly'
-];
+]);
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'PS4 Scraper',
-    timestamp: new Date().toISOString()
-  });
-});
+// Central regexes
+const DLC_RE = /\b(dlc|downloadable\s*content|season\s*pass|expansion|add[- ]?on|bonus\s*pack|costume\s*pack|character\s*pack)\b/i;
+const UPDATE_RE = /\b(update|patch|ver(?:sion)?\.?\s*\d|v\d+\.\d+)\b/i;
+const NAV_TEXT_RE = /\b(guide\s*download|tool\s*download|guide\s*download\s*game|daily\s*update|update\s*list\s*all\s*game|list\s*all\s*game|all\s*game\s*(ps[2345]|vita|psp)|ps[2345]\s*list|home|about|contact|privacy|terms|login|register|search|category|tag|archive|sitemap)\b/i;
+const DOWNLOAD_SIGNAL_RE = /\b(download|mirror|part\s*\d+|pkg|base|game|disc|iso|link|host)\b/i;
+const HOST_LABEL_RE = /^(mediafire|1fichier|1file|mega|gofile|pixeldrain|akia|akira|akirabox|viki|viking|vikingfile|dropbox|drive|google\s*drive|qiwi|katfile|mixdrop|workupload|mirror\s*\d*|part\s*\d+|link\s*\d+)$/i;
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', uptime: process.uptime() });
-});
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: MAX_BODY_BYTES }));
 
-// Endpoint principal
-app.post('/scrape', async (req, res) => {
-  // Auth
-  const authHeader = req.headers['x-api-key'];
-  if (authHeader !== API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+const cache = new Map();
 
-  const { url, titleId, gameName, attemptCaptcha } = req.body;
+function newReqId() {
+  return crypto.randomBytes(4).toString('hex');
+}
 
-  if (!url) {
-    return res.status(400).json({ error: 'URL is required' });
-  }
+function log(reqId, stage, ...args) {
+  console.log(`[REQ ${reqId}] [${stage}]`, ...args);
+}
 
-  // Cache key
-  const cacheKey = `${url}|${titleId || ''}|${gameName || ''}`;
-  const cached = cache.get(cacheKey);
-
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    console.log('[CACHE] Hit for', url);
-    return res.json({ ...cached.data, cached: true });
-  }
-
-  console.log('[SCRAPE] Starting:', url);
-
-  try {
-    const result = await scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha);
-
-    cache.set(cacheKey, {
-      data: result,
-      timestamp: Date.now()
-    });
-
-    console.log('[SCRAPE] Success:', result.stats);
-    res.json(result);
-
-  } catch (error) {
-    console.error('[SCRAPE] Error:', error.message);
-
-    res.status(500).json({
-      error: error.message,
-      url,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
+// ---------------------------------------------------------------------------
+// URL helpers + central validation
+// ---------------------------------------------------------------------------
 function hostOf(value) {
   try {
     return new URL(value).hostname.toLowerCase();
@@ -114,132 +98,178 @@ function hostOf(value) {
   }
 }
 
+function isHttpUrl(value) {
+  try {
+    const u = new URL(value);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 function isKnownFinalHost(hostname) {
   if (!hostname) return false;
-  return DOWNLOAD_HOST_HINTS.some(h => hostname.includes(h));
+  return DOWNLOAD_HOST_HINTS.some((h) => hostname.includes(h));
 }
 
 function isIntermediateHost(hostname) {
   if (!hostname) return false;
-  return INTERMEDIATE_HOSTS.some(h => hostname.includes(h));
+  return INTERMEDIATE_HOSTS.some((h) => hostname.includes(h));
+}
+
+function samePageUrl(a, b) {
+  try {
+    const ua = new URL(a);
+    const ub = new URL(b);
+    const ha = ua.hostname.replace(/^www\./, '');
+    const hb = ub.hostname.replace(/^www\./, '');
+    const pa = ua.pathname.replace(/\/$/, '') || '/';
+    const pb = ub.pathname.replace(/\/$/, '') || '/';
+    return ha === hb && pa === pb;
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Tenta extrair a URL final embutida em encurtadores (ex: shrinkearn ?url=base64).
- * Não faz navegação — só parse da query string.
+ * Central validation for a candidate resolved URL.
+ * success/valid means: HTTP(S), not empty, not same as source page,
+ * not an intermediate host, and is a known final download host.
+ */
+function validateResolvedUrl(candidateUrl, originalUrl, sourcePageUrl) {
+  if (!candidateUrl || typeof candidateUrl !== 'string') {
+    return { valid: false, url: null, host: '', reason: 'URL vazia ou inválida' };
+  }
+
+  if (!isHttpUrl(candidateUrl)) {
+    return { valid: false, url: null, host: '', reason: 'Protocolo não HTTP(S)' };
+  }
+
+  const host = hostOf(candidateUrl);
+  if (!host) {
+    return { valid: false, url: null, host: '', reason: 'Host ausente' };
+  }
+
+  if (sourcePageUrl && samePageUrl(candidateUrl, sourcePageUrl)) {
+    return { valid: false, url: null, host, reason: 'Mesma URL da página de origem' };
+  }
+
+  if (originalUrl && samePageUrl(candidateUrl, originalUrl) && !isKnownFinalHost(host)) {
+    return { valid: false, url: null, host, reason: 'Igual à URL original sem ser host final' };
+  }
+
+  if (isIntermediateHost(host)) {
+    return { valid: false, url: null, host, reason: 'Host intermediário' };
+  }
+
+  if (!isKnownFinalHost(host)) {
+    return { valid: false, url: null, host, reason: 'Host não é destino final conhecido' };
+  }
+
+  return { valid: true, url: candidateUrl, host, reason: 'ok' };
+}
+
+/**
+ * Extract embedded destination from shortener query (e.g. shrinkearn ?url=base64).
+ * Does NOT mark success — only returns a candidate string or null.
  */
 function tryDecodeEmbeddedUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
     const host = u.hostname.toLowerCase();
 
-    // shrinkearn / shrinkme: parâmetro "url" em base64
     if (host.includes('shrinkearn') || host.includes('shrinkme')) {
       const encoded = u.searchParams.get('url');
       if (encoded) {
-        // base64 pode vir com padding incompleto
         let b64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
         while (b64.length % 4) b64 += '=';
         const decoded = Buffer.from(b64, 'base64').toString('utf8').trim();
-        if (/^https?:\/\//i.test(decoded)) {
-          return decoded;
-        }
+        if (/^https?:\/\//i.test(decoded)) return decoded;
       }
     }
 
-    // Outros encurtadores às vezes usam ?url= ou ?destination= em plain text
     for (const key of ['url', 'destination', 'dest', 'target', 'r', 'redirect']) {
       const val = u.searchParams.get(key);
-      if (val && /^https?:\/\//i.test(val)) {
-        return val;
-      }
+      if (val && /^https?:\/\//i.test(val)) return val;
     }
-  } catch (e) {
+  } catch {
     // ignore
   }
   return null;
 }
 
 /**
- * Resolve uma URL intermediária para o destino final.
- * 1) Decode embutido (shrinkearn base64) — rápido, sem rede
- * 2) Se já for host final conhecido → success com a própria URL
- * 3) Senão tenta page.goto e segue redirects HTTP
+ * Resolve intermediate → validated final URL.
+ * Never sets success=true without validateResolvedUrl.
  */
-async function resolveLink(page, originalHref) {
+async function resolveLink(page, originalHref, sourcePageUrl, reqId) {
   const originalHost = hostOf(originalHref);
 
-  // Já é destino final conhecido
+  // Already a known final host
   if (isKnownFinalHost(originalHost)) {
-    return {
-      success: true,
-      url: originalHref,
-      host: originalHost,
-      method: 'direct'
-    };
+    const v = validateResolvedUrl(originalHref, originalHref, sourcePageUrl);
+    if (v.valid) {
+      log(reqId, 'RESOLVE', `final accepted (direct) ${v.host}`);
+      return { success: true, url: v.url, host: v.host, method: 'direct' };
+    }
+    log(reqId, 'RESOLVE', `direct rejected: ${v.reason}`);
+    return { success: false, url: null, host: v.host, error: v.reason, method: 'direct' };
   }
 
-  // Tentativa de decode embutido (shrinkearn etc.)
+  // Embedded candidate
   const embedded = tryDecodeEmbeddedUrl(originalHref);
   if (embedded) {
-    const embHost = hostOf(embedded);
-    console.log('[RESOLVE] decoded embedded:', originalHost, '→', embHost, embedded.slice(0, 80));
-    return {
-      success: true,
-      url: embedded,
-      host: embHost,
-      method: 'embedded'
-    };
+    log(reqId, 'RESOLVE', `embedded candidate: ${originalHost} → ${hostOf(embedded)} ${embedded.slice(0, 90)}`);
+    const v = validateResolvedUrl(embedded, originalHref, sourcePageUrl);
+    if (v.valid) {
+      log(reqId, 'RESOLVE', `final accepted (embedded) ${v.host}`);
+      return { success: true, url: v.url, host: v.host, method: 'embedded' };
+    }
+    log(reqId, 'RESOLVE', `embedded rejected: ${v.reason}`);
+    // fall through to navigate if intermediate, else fail
   }
 
-  // Não é intermediário conhecido e não decodificou → devolve como está
+  // Unknown non-intermediate host: do not claim success
   if (!isIntermediateHost(originalHost)) {
+    log(reqId, 'RESOLVE', `passthrough rejected: unknown host ${originalHost}`);
     return {
-      success: true,
-      url: originalHref,
+      success: false,
+      url: null,
       host: originalHost,
+      error: 'Host não reconhecido como destino final',
       method: 'passthrough'
     };
   }
 
-  // Fallback: navegar e seguir redirects HTTP
+  // Navigate intermediate (HTTP redirects only — no CAPTCHA/paywall bypass)
   try {
-    console.log('[RESOLVE] navigating:', originalHref.slice(0, 100));
+    log(reqId, 'RESOLVE', `navigating: ${originalHref.slice(0, 100)}`);
     const response = await page.goto(originalHref, {
       waitUntil: 'domcontentloaded',
-      timeout: 15000
+      timeout: RESOLVE_GOTO_TIMEOUT_MS
     });
-
-    // Espera curta por possíveis redirects JS leves
-    await new Promise(r => setTimeout(r, 1200));
+    await new Promise((r) => setTimeout(r, POST_RESOLVE_WAIT_MS));
 
     const finalUrl = page.url() || originalHref;
-    const finalHost = hostOf(finalUrl);
     const status = response?.status?.() ?? null;
+    const v = validateResolvedUrl(finalUrl, originalHref, sourcePageUrl);
 
-    // Se ainda estamos no intermediário, não conseguimos resolver
-    if (isIntermediateHost(finalHost) && finalHost === originalHost) {
-      console.log('[RESOLVE] still on intermediate after nav:', finalHost);
+    if (!v.valid) {
+      log(reqId, 'RESOLVE', `navigated rejected: ${v.reason} host=${v.host || hostOf(finalUrl)}`);
       return {
         success: false,
         url: null,
-        host: finalHost,
-        error: 'Ainda no host intermediário após navegação',
+        host: v.host || hostOf(finalUrl),
+        error: v.reason,
         method: 'navigate',
         status
       };
     }
 
-    console.log('[RESOLVE] navigated:', originalHost, '→', finalHost, finalUrl.slice(0, 80));
-    return {
-      success: true,
-      url: finalUrl,
-      host: finalHost,
-      method: 'navigate',
-      status
-    };
+    log(reqId, 'RESOLVE', `final accepted (navigate) ${v.host}`);
+    return { success: true, url: v.url, host: v.host, method: 'navigate', status };
   } catch (err) {
-    console.log('[RESOLVE] nav error:', err.message);
+    log(reqId, 'RESOLVE', `nav error: ${err.message}`);
     return {
       success: false,
       url: null,
@@ -250,59 +280,77 @@ async function resolveLink(page, originalHref) {
   }
 }
 
-async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
-  const chromium = (await chromiumPromise).default;
+// ---------------------------------------------------------------------------
+// Classification
+// ---------------------------------------------------------------------------
+function classifyLink(link) {
+  const text = (link.text || '').toLowerCase();
+  const href = (link.href || '').toLowerCase();
+  const immediate = (link.immediateText || '').toLowerCase();
 
-  const browser = await puppeteerExtra.launch({
-    args: [
-      ...chromium.args,
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-      '--window-size=1920,1080'
-    ],
-    executablePath: await chromium.executablePath(),
-    headless: chromium.headless,
-    defaultViewport: {
-      width: 1920,
-      height: 1080
+  if (NAV_TEXT_RE.test(text)) return null;
+
+  if (DLC_RE.test(text) || DLC_RE.test(href)) return 'dlcs';
+
+  if (UPDATE_RE.test(text) || UPDATE_RE.test(href)) {
+    if (!/list\s*all|daily\s*update|guide|tool/i.test(text)) return 'updates';
+  }
+
+  if (immediate.length > 0 && immediate.length < 120) {
+    if (DLC_RE.test(immediate) && !/list\s*all|guide|tool/i.test(immediate)) return 'dlcs';
+    if (UPDATE_RE.test(immediate) && !/list\s*all|daily\s*update|guide|tool/i.test(immediate)) {
+      return 'updates';
     }
-  });
+  }
 
-  const page = await browser.newPage();
+  return 'base';
+}
 
-  // Stealth measures
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, 'webdriver', {
-      get: () => undefined
-    });
+function classifyLinks(links) {
+  const classified = { base: [], updates: [], dlcs: [] };
 
-    Object.defineProperty(navigator, 'plugins', {
-      get: () => [1, 2, 3, 4, 5]
-    });
+  for (const link of links) {
+    const type = classifyLink(link);
+    if (!type) continue;
 
-    Object.defineProperty(navigator, 'languages', {
-      get: () => ['pt-BR', 'pt', 'en-US', 'en']
-    });
-  });
+    const finalHost =
+      link.resolved && link.resolved.success && link.resolved.host
+        ? link.resolved.host
+        : link.host;
 
-  await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
-  );
+    const entry = {
+      href: link.href,
+      text: link.text,
+      host: finalHost,
+      originalUrl: link.href,
+      resolved: link.resolved
+        ? {
+            success: !!link.resolved.success,
+            url: link.resolved.success ? link.resolved.url : null,
+            error: link.resolved.success
+              ? undefined
+              : link.resolved.error || 'Não resolvido',
+            method: link.resolved.method || undefined
+          }
+        : {
+            success: false,
+            url: null,
+            error: 'Resolução não executada'
+          }
+    };
 
-  try {
-    await page.goto(url, {
-      waitUntil: 'networkidle0',
-      timeout: 30000
-    });
+    classified[type].push(entry);
+  }
 
-    await new Promise(r => setTimeout(r, 2000));
+  return classified;
+}
 
-    const pageTitle = await page.title().catch(() => 'Unknown');
-    const finalUrl = page.url();
-
-    // Extrai links com análise estrutural + diagnóstico
-    const extractResult = await page.evaluate(() => {
+// ---------------------------------------------------------------------------
+// Extraction (runs inside page.evaluate — lists inlined intentionally)
+// ---------------------------------------------------------------------------
+async function extractLinks(page) {
+  return page.evaluate(
+    ({ downloadHints, intermediateHosts, maxCandidates }) => {
       const diag = {
         totalAnchors: 0,
         discardedNav: 0,
@@ -315,42 +363,16 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
       const results = [];
       const seen = new Set();
 
-      const DOWNLOAD_HOST_HINTS = [
-        'mediafire',
-        '1fichier',
-        'mega.nz',
-        'mega.co.nz',
-        'mega',
-        'gofile',
-        'pixeldrain',
-        'qiwi',
-        'katfile',
-        'mixdrop',
-        'dropbox',
-        'drive.google',
-        'googleusercontent',
-        'akirabox',
-        'vikingfile',
-        'workupload'
-      ];
-
-      const INTERMEDIATE_HOSTS = [
-        'shrinkearn.com',
-        'shrinkme.io',
-        'linkvertise.com',
-        'ouo.io',
-        'adf.ly',
-        'bit.ly',
-        'cutt.ly'
-      ];
-
-      const HOST_LABEL_RE = /^(mediafire|1fichier|1file|mega|gofile|pixeldrain|akia|akira|akirabox|viki|viking|vikingfile|dropbox|drive|google\s*drive|qiwi|katfile|mixdrop|workupload|mirror\s*\d*|part\s*\d+|link\s*\d+)$/i;
-
-      const NAV_TEXT_RE = /\b(guide\s*download|tool\s*download|guide\s*download\s*game|daily\s*update|update\s*list\s*all\s*game|list\s*all\s*game|all\s*game\s*(ps[2345]|vita|psp)|ps[2345]\s*list|home|about|contact|privacy|terms|login|register|search|category|tag|archive|sitemap)\b/i;
-
-      const DOWNLOAD_SIGNAL_RE = /\b(download|mirror|part\s*\d+|pkg|base|game|disc|iso|link|host)\b/i;
-      const DLC_SIGNAL_RE = /\b(dlc|downloadable\s*content|season\s*pass|expansion|add[- ]?on|bonus\s*pack|costume\s*pack|character\s*pack)\b/i;
-      const UPDATE_SIGNAL_RE = /\b(update|patch|ver(?:sion)?\.?\s*\d|v\d+\.\d+)\b/i;
+      const HOST_LABEL_RE =
+        /^(mediafire|1fichier|1file|mega|gofile|pixeldrain|akia|akira|akirabox|viki|viking|vikingfile|dropbox|drive|google\s*drive|qiwi|katfile|mixdrop|workupload|mirror\s*\d*|part\s*\d+|link\s*\d+)$/i;
+      const NAV_TEXT_RE =
+        /\b(guide\s*download|tool\s*download|guide\s*download\s*game|daily\s*update|update\s*list\s*all\s*game|list\s*all\s*game|all\s*game\s*(ps[2345]|vita|psp)|ps[2345]\s*list|home|about|contact|privacy|terms|login|register|search|category|tag|archive|sitemap)\b/i;
+      const DOWNLOAD_SIGNAL_RE =
+        /\b(download|mirror|part\s*\d+|pkg|base|game|disc|iso|link|host)\b/i;
+      const DLC_SIGNAL_RE =
+        /\b(dlc|downloadable\s*content|season\s*pass|expansion|add[- ]?on|bonus\s*pack|costume\s*pack|character\s*pack)\b/i;
+      const UPDATE_SIGNAL_RE =
+        /\b(update|patch|ver(?:sion)?\.?\s*\d|v\d+\.\d+)\b/i;
 
       const anchors = Array.from(document.querySelectorAll('a[href]'));
       diag.totalAnchors = anchors.length;
@@ -375,7 +397,6 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
           diag.discardedNav++;
           continue;
         }
-
         if (NAV_TEXT_RE.test(text)) {
           diag.discardedNavText++;
           continue;
@@ -384,7 +405,9 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         const immediate = a.closest('li, td, th, p, span, div');
         let immediateText = '';
         if (immediate) {
-          const raw = (immediate.innerText || immediate.textContent || '').replace(/\s+/g, ' ').trim();
+          const raw = (immediate.innerText || immediate.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim();
           immediateText = raw.length > 160 ? raw.slice(0, 160) : raw;
         }
 
@@ -395,21 +418,23 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
           continue;
         }
 
-        const isKnownFinalHost = DOWNLOAD_HOST_HINTS.some(h => host.includes(h));
-        const isIntermediate = INTERMEDIATE_HOSTS.some(h => host.includes(h));
+        const isKnownFinal = downloadHints.some((h) => host.includes(h));
+        const isIntermediate = intermediateHosts.some((h) => host.includes(h));
         const hasFileExt = /\.(pkg|zip|rar|7z)(?:$|[?#])/i.test(href);
         const isHostLabel = HOST_LABEL_RE.test(text);
         const hasDownloadText = DOWNLOAD_SIGNAL_RE.test(text);
         const hasDlcOrUpdate = DLC_SIGNAL_RE.test(text) || UPDATE_SIGNAL_RE.test(text);
-        const textMentionsHost = DOWNLOAD_HOST_HINTS.some(h => text.toLowerCase().includes(h)) ||
+        const textMentionsHost =
+          downloadHints.some((h) => text.toLowerCase().includes(h)) ||
           /akia|akira|viki|viking|1file/i.test(text);
 
         const strongSignal =
-          isKnownFinalHost ||
+          isKnownFinal ||
           hasFileExt ||
           isHostLabel ||
           textMentionsHost ||
-          (isIntermediate && (isHostLabel || textMentionsHost || hasDownloadText || hasDlcOrUpdate || inContent)) ||
+          (isIntermediate &&
+            (isHostLabel || textMentionsHost || hasDownloadText || hasDlcOrUpdate || inContent)) ||
           hasDownloadText ||
           hasDlcOrUpdate;
 
@@ -419,22 +444,28 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         }
 
         let score = 0;
-        if (isKnownFinalHost) score += 10;
+        if (isKnownFinal) score += 10;
         if (hasFileExt) score += 8;
         if (isHostLabel || textMentionsHost) score += 8;
         if (isIntermediate && inContent) score += 6;
         if (hasDownloadText) score += 4;
         if (hasDlcOrUpdate) score += 3;
         if (inContent) score += 4;
-        if (immediateText && (DOWNLOAD_SIGNAL_RE.test(immediateText) || /mediafire|1fichier|akira|viking|mega/i.test(immediateText))) {
+        if (
+          immediateText &&
+          (DOWNLOAD_SIGNAL_RE.test(immediateText) ||
+            /mediafire|1fichier|akira|viking|mega/i.test(immediateText))
+        ) {
           score += 2;
         }
 
         try {
-          if (new URL(href).origin === location.origin && !hasFileExt && !isKnownFinalHost) {
+          if (new URL(href).origin === location.origin && !hasFileExt && !isKnownFinal) {
             score -= 5;
           }
-        } catch {}
+        } catch {
+          // ignore
+        }
 
         if (score < 3) {
           diag.discardedLowScore++;
@@ -454,134 +485,100 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
       }
 
       results.sort((a, b) => b.score - a.score);
-      return {
-        links: results.slice(0, 60),
-        diag
-      };
+      return { links: results.slice(0, maxCandidates), diag };
+    },
+    {
+      downloadHints: DOWNLOAD_HOST_HINTS,
+      intermediateHosts: INTERMEDIATE_HOSTS,
+      maxCandidates: MAX_CANDIDATES
+    }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Scrape pipeline
+// ---------------------------------------------------------------------------
+async function scrapeWithPuppeteer(url, titleId, gameName, reqId) {
+  const chromium = (await chromiumPromise).default;
+
+  const browser = await puppeteerExtra.launch({
+    args: [
+      ...chromium.args,
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--window-size=1920,1080'
+    ],
+    executablePath: await chromium.executablePath(),
+    headless: chromium.headless,
+    defaultViewport: { width: 1920, height: 1080 }
+  });
+
+  try {
+    const page = await browser.newPage();
+
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['pt-BR', 'pt', 'en-US', 'en']
+      });
     });
 
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36'
+    );
+
+    log(reqId, 'SCRAPE', `goto ${url}`);
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: PAGE_GOTO_TIMEOUT_MS });
+    await new Promise((r) => setTimeout(r, POST_LOAD_WAIT_MS));
+
+    const pageTitle = await page.title().catch(() => 'Unknown');
+    const finalUrl = page.url();
+
+    log(reqId, 'EXTRACT', 'start');
+    const extractResult = await extractLinks(page);
     const links = extractResult.links || [];
     const diag = extractResult.diag || {};
+    log(reqId, 'EXTRACT', `diag ${JSON.stringify(diag)}`);
+    log(reqId, 'EXTRACT', `sample ${JSON.stringify(links.slice(0, 6).map((l) => l.text))}`);
 
-    console.log('[EXTRACT] diag:', JSON.stringify(diag));
-    console.log('[EXTRACT] sample texts:', links.slice(0, 8).map(l => l.text));
-
-    // Resolve URLs intermediárias (com cache local nesta execução)
     const resolutionCache = new Map();
     let resolvedOk = 0;
     let resolvedFail = 0;
 
+    log(reqId, 'RESOLVE', `start count=${links.length}`);
     for (const link of links) {
       if (resolutionCache.has(link.href)) {
         link.resolved = resolutionCache.get(link.href);
         continue;
       }
-
-      const resolution = await resolveLink(page, link.href);
+      const resolution = await resolveLink(page, link.href, finalUrl, reqId);
       resolutionCache.set(link.href, resolution);
       link.resolved = resolution;
-
-      if (resolution.success) {
-        resolvedOk++;
-      } else {
-        resolvedFail++;
-      }
+      if (resolution.success) resolvedOk++;
+      else resolvedFail++;
     }
+    log(reqId, 'RESOLVE', `ok=${resolvedOk} fail=${resolvedFail} unique=${resolutionCache.size}`);
 
-    console.log('[RESOLVE] ok=%d fail=%d unique=%d', resolvedOk, resolvedFail, resolutionCache.size);
-
-    // Classifica usando principalmente o texto do próprio link
-    const classified = {
-      base: [],
-      updates: [],
-      dlcs: []
-    };
-
-    const DLC_RE = /\b(dlc|downloadable\s*content|season\s*pass|expansion|add[- ]?on|bonus\s*pack|costume\s*pack|character\s*pack)\b/i;
-    const UPDATE_RE = /\b(update|patch|ver(?:sion)?\.?\s*\d|v\d+\.\d+)\b/i;
-    const NAV_TEXT_RE = /\b(guide\s*download|tool\s*download|guide\s*download\s*game|daily\s*update|update\s*list\s*all\s*game|list\s*all\s*game|all\s*game\s*(ps[2345]|vita|psp)|ps[2345]\s*list)\b/i;
-
-    for (const link of links) {
-      const text = (link.text || '').toLowerCase();
-      const href = (link.href || '').toLowerCase();
-      const immediate = (link.immediateText || '').toLowerCase();
-
-      if (NAV_TEXT_RE.test(text)) continue;
-
-      // Host final preferido: resolved.url se sucesso, senão o host original
-      const finalHost =
-        (link.resolved && link.resolved.success && link.resolved.host)
-          ? link.resolved.host
-          : link.host;
-
-      const entry = {
-        href: link.href,
-        text: link.text,
-        host: finalHost,
-        originalUrl: link.href,
-        resolved: link.resolved
-          ? {
-              success: !!link.resolved.success,
-              url: link.resolved.success ? link.resolved.url : null,
-              error: link.resolved.success ? undefined : (link.resolved.error || 'Não resolvido'),
-              method: link.resolved.method || undefined
-            }
-          : {
-              success: false,
-              url: null,
-              error: 'Resolução não executada'
-            }
-      };
-
-      // Prioridade: sinais no próprio texto do <a>
-      if (DLC_RE.test(text) || DLC_RE.test(href)) {
-        classified.dlcs.push(entry);
-        continue;
-      }
-
-      if (UPDATE_RE.test(text) || UPDATE_RE.test(href)) {
-        if (!/list\s*all|daily\s*update|guide|tool/i.test(text)) {
-          classified.updates.push(entry);
-          continue;
-        }
-      }
-
-      // Reforço com contexto imediato curto
-      if (immediate.length > 0 && immediate.length < 120) {
-        if (DLC_RE.test(immediate) && !/list\s*all|guide|tool/i.test(immediate)) {
-          classified.dlcs.push(entry);
-          continue;
-        }
-        if (UPDATE_RE.test(immediate) && !/list\s*all|daily\s*update|guide|tool/i.test(immediate)) {
-          classified.updates.push(entry);
-          continue;
-        }
-      }
-
-      classified.base.push(entry);
-    }
-
-    await browser.close();
-
+    log(reqId, 'CLASSIFY', 'start');
+    const classified = classifyLinks(links);
     const totalFound =
-      classified.base.length +
-      classified.updates.length +
-      classified.dlcs.length;
-
-    console.log('[CLASSIFY] base=%d updates=%d dlcs=%d', classified.base.length, classified.updates.length, classified.dlcs.length);
+      classified.base.length + classified.updates.length + classified.dlcs.length;
+    log(
+      reqId,
+      'CLASSIFY',
+      `base=${classified.base.length} updates=${classified.updates.length} dlcs=${classified.dlcs.length}`
+    );
 
     return {
       success: true,
-
       titleId: titleId || null,
-
       game: {
         title: pageTitle,
         sourceUrl: finalUrl
       },
-
       links: classified,
-
       stats: {
         found: totalFound,
         base: classified.base.length,
@@ -590,28 +587,111 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         resolved: resolvedOk,
         failed: resolvedFail
       },
-
       timestamp: new Date().toISOString()
     };
-
-  } catch (error) {
-    await browser.close();
-    throw error;
+  } finally {
+    try {
+      await browser.close();
+    } catch (e) {
+      log(reqId, 'SCRAPE', `browser close warn: ${e.message}`);
+    }
   }
 }
 
-// Limpa cache antigo a cada hora
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'PS4 Scraper',
+    version: CACHE_LOGIC_VERSION,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    uptime: process.uptime(),
+    cacheSize: cache.size,
+    version: CACHE_LOGIC_VERSION
+  });
+});
+
+app.post('/scrape', async (req, res) => {
+  const reqId = newReqId();
+  log(reqId, 'START', 'POST /scrape');
+
+  const authHeader = req.headers['x-api-key'];
+  if (authHeader !== API_KEY) {
+    log(reqId, 'AUTH', 'unauthorized');
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+
+  const body = req.body || {};
+  const url = typeof body.url === 'string' ? body.url.trim() : '';
+  const titleId = typeof body.titleId === 'string' ? body.titleId.trim() : '';
+  const gameName = typeof body.gameName === 'string' ? body.gameName.trim() : '';
+
+  if (!url) {
+    log(reqId, 'VALIDATE', 'missing url');
+    return res.status(400).json({ success: false, error: 'URL is required' });
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    log(reqId, 'VALIDATE', 'invalid url');
+    return res.status(400).json({ success: false, error: 'Invalid URL' });
+  }
+
+  if (!/^https?:$/i.test(parsed.protocol)) {
+    log(reqId, 'VALIDATE', 'bad protocol');
+    return res.status(400).json({ success: false, error: 'URL must be HTTP or HTTPS' });
+  }
+
+  const cacheKey = `${CACHE_LOGIC_VERSION}|${url}|${titleId}|${gameName}`;
+  const cached = cache.get(cacheKey);
+
+  if (cached) {
+    const age = Date.now() - cached.timestamp;
+    if (age < CACHE_TTL_MS) {
+      log(reqId, 'CACHE', `HIT ageMs=${age}`);
+      return res.json({ ...cached.data, cached: true });
+    }
+    log(reqId, 'CACHE', 'EXPIRED');
+    cache.delete(cacheKey);
+  } else {
+    log(reqId, 'CACHE', 'MISS');
+  }
+
+  try {
+    const result = await scrapeWithPuppeteer(url, titleId, gameName, reqId);
+    cache.set(cacheKey, { data: result, timestamp: Date.now() });
+    log(reqId, 'RESPONSE', JSON.stringify(result.stats));
+    return res.json({ ...result, cached: false });
+  } catch (error) {
+    log(reqId, 'ERROR', error.message);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Scrape failed',
+      url,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Periodic cache cleanup
 setInterval(() => {
   const now = Date.now();
-
   for (const [key, value] of cache.entries()) {
-    if (now - value.timestamp > CACHE_TTL) {
-      cache.delete(key);
-    }
+    if (now - value.timestamp > CACHE_TTL_MS) cache.delete(key);
   }
-}, 1000 * 60 * 60);
+}, CACHE_TTL_MS);
 
-app.listen(PORT, () => {
-  console.log(`🚀 Scraper rodando na porta ${PORT}`);
-  console.log(`🔑 API Key: ${API_KEY.substring(0, 4)}...`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[BOOT] PS4 Scraper ${CACHE_LOGIC_VERSION} on 0.0.0.0:${PORT}`);
+  console.log(`[BOOT] API key prefix: ${String(API_KEY).substring(0, 4)}...`);
 });

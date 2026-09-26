@@ -1,0 +1,21 @@
+{
+  "name": "ps4-scraper",
+  "version": "2.0.0",
+  "private": true,
+  "description": "PS4 Library scraper service (Fly.io)",
+  "main": "scraper-service.js",
+  "scripts": {
+    "start": "node scraper-service.js",
+    "dev": "node scraper-service.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@sparticuz/chromium": "^133.0.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
