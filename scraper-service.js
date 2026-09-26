@@ -273,9 +273,6 @@ async function resolveLink(page, originalHref, sourcePageUrl, reqId) {
   // Allow navigation to complete without Puppeteer's default navigation timeout.
   page.setDefaultNavigationTimeout(0);
 
- // No seu resolveLink, antes de navegar:
-await page.setDefaultNavigationTimeout(0);
-
 // Comportamento humano antes de clicar
 await page.mouse.move(
 Math.random() * 800 + 100,
