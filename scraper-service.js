@@ -270,6 +270,12 @@ async function navigateOnce(page, targetUrl, reqId) {
  * Never sets success=true from parse alone.
  */
 async function resolveLink(page, originalHref, sourcePageUrl, reqId) {
+  // Allow navigation to complete without Puppeteer's default navigation timeout.
+  page.setDefaultNavigationTimeout(0);
+
+  // CUSTOM INTERACTION CONFIGURATION
+  // Espaço reservado para configurações adicionais de interação.
+
   log(reqId, 'RESOLVE', `original URL: ${String(originalHref).slice(0, 120)}`);
 
   const originalHost = hostOf(originalHref);
