@@ -17,6 +17,35 @@ const PORT = process.env.PORT || 8080;
 const cache = new Map();
 const CACHE_TTL = 1000 * 60 * 60; // 1 hora
 
+const DOWNLOAD_HOST_HINTS = [
+  'mediafire',
+  '1fichier',
+  'mega.nz',
+  'mega.co.nz',
+  'mega',
+  'gofile',
+  'pixeldrain',
+  'qiwi',
+  'katfile',
+  'mixdrop',
+  'dropbox',
+  'drive.google',
+  'googleusercontent',
+  'akirabox',
+  'vikingfile',
+  'workupload'
+];
+
+const INTERMEDIATE_HOSTS = [
+  'shrinkearn.com',
+  'shrinkme.io',
+  'linkvertise.com',
+  'ouo.io',
+  'adf.ly',
+  'bit.ly',
+  'cutt.ly'
+];
+
 // Health check
 app.get('/', (req, res) => {
   res.json({
@@ -76,6 +105,150 @@ app.post('/scrape', async (req, res) => {
     });
   }
 });
+
+function hostOf(value) {
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function isKnownFinalHost(hostname) {
+  if (!hostname) return false;
+  return DOWNLOAD_HOST_HINTS.some(h => hostname.includes(h));
+}
+
+function isIntermediateHost(hostname) {
+  if (!hostname) return false;
+  return INTERMEDIATE_HOSTS.some(h => hostname.includes(h));
+}
+
+/**
+ * Tenta extrair a URL final embutida em encurtadores (ex: shrinkearn ?url=base64).
+ * Não faz navegação — só parse da query string.
+ */
+function tryDecodeEmbeddedUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const host = u.hostname.toLowerCase();
+
+    // shrinkearn / shrinkme: parâmetro "url" em base64
+    if (host.includes('shrinkearn') || host.includes('shrinkme')) {
+      const encoded = u.searchParams.get('url');
+      if (encoded) {
+        // base64 pode vir com padding incompleto
+        let b64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        const decoded = Buffer.from(b64, 'base64').toString('utf8').trim();
+        if (/^https?:\/\//i.test(decoded)) {
+          return decoded;
+        }
+      }
+    }
+
+    // Outros encurtadores às vezes usam ?url= ou ?destination= em plain text
+    for (const key of ['url', 'destination', 'dest', 'target', 'r', 'redirect']) {
+      const val = u.searchParams.get(key);
+      if (val && /^https?:\/\//i.test(val)) {
+        return val;
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * Resolve uma URL intermediária para o destino final.
+ * 1) Decode embutido (shrinkearn base64) — rápido, sem rede
+ * 2) Se já for host final conhecido → success com a própria URL
+ * 3) Senão tenta page.goto e segue redirects HTTP
+ */
+async function resolveLink(page, originalHref) {
+  const originalHost = hostOf(originalHref);
+
+  // Já é destino final conhecido
+  if (isKnownFinalHost(originalHost)) {
+    return {
+      success: true,
+      url: originalHref,
+      host: originalHost,
+      method: 'direct'
+    };
+  }
+
+  // Tentativa de decode embutido (shrinkearn etc.)
+  const embedded = tryDecodeEmbeddedUrl(originalHref);
+  if (embedded) {
+    const embHost = hostOf(embedded);
+    console.log('[RESOLVE] decoded embedded:', originalHost, '→', embHost, embedded.slice(0, 80));
+    return {
+      success: true,
+      url: embedded,
+      host: embHost,
+      method: 'embedded'
+    };
+  }
+
+  // Não é intermediário conhecido e não decodificou → devolve como está
+  if (!isIntermediateHost(originalHost)) {
+    return {
+      success: true,
+      url: originalHref,
+      host: originalHost,
+      method: 'passthrough'
+    };
+  }
+
+  // Fallback: navegar e seguir redirects HTTP
+  try {
+    console.log('[RESOLVE] navigating:', originalHref.slice(0, 100));
+    const response = await page.goto(originalHref, {
+      waitUntil: 'domcontentloaded',
+      timeout: 15000
+    });
+
+    // Espera curta por possíveis redirects JS leves
+    await new Promise(r => setTimeout(r, 1200));
+
+    const finalUrl = page.url() || originalHref;
+    const finalHost = hostOf(finalUrl);
+    const status = response?.status?.() ?? null;
+
+    // Se ainda estamos no intermediário, não conseguimos resolver
+    if (isIntermediateHost(finalHost) && finalHost === originalHost) {
+      console.log('[RESOLVE] still on intermediate after nav:', finalHost);
+      return {
+        success: false,
+        url: null,
+        host: finalHost,
+        error: 'Ainda no host intermediário após navegação',
+        method: 'navigate',
+        status
+      };
+    }
+
+    console.log('[RESOLVE] navigated:', originalHost, '→', finalHost, finalUrl.slice(0, 80));
+    return {
+      success: true,
+      url: finalUrl,
+      host: finalHost,
+      method: 'navigate',
+      status
+    };
+  } catch (err) {
+    console.log('[RESOLVE] nav error:', err.message);
+    return {
+      success: false,
+      url: null,
+      host: null,
+      error: err.message || 'Falha ao navegar na URL intermediária',
+      method: 'navigate'
+    };
+  }
+}
 
 async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
   const chromium = (await chromiumPromise).default;
@@ -142,7 +315,6 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
       const results = [];
       const seen = new Set();
 
-      // Hosts finais conhecidos (aparecem no href OU no texto do link)
       const DOWNLOAD_HOST_HINTS = [
         'mediafire',
         '1fichier',
@@ -162,7 +334,6 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         'workupload'
       ];
 
-      // Encurtadores / intermediários usados pelo site (href real dos botões)
       const INTERMEDIATE_HOSTS = [
         'shrinkearn.com',
         'shrinkme.io',
@@ -173,10 +344,8 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         'cutt.ly'
       ];
 
-      // Texto do link que é rótulo de host de download (comum no dlpsgame)
       const HOST_LABEL_RE = /^(mediafire|1fichier|1file|mega|gofile|pixeldrain|akia|akira|akirabox|viki|viking|vikingfile|dropbox|drive|google\s*drive|qiwi|katfile|mixdrop|workupload|mirror\s*\d*|part\s*\d+|link\s*\d+)$/i;
 
-      // Texto de navegação / listas gerais → descartar
       const NAV_TEXT_RE = /\b(guide\s*download|tool\s*download|guide\s*download\s*game|daily\s*update|update\s*list\s*all\s*game|list\s*all\s*game|all\s*game\s*(ps[2345]|vita|psp)|ps[2345]\s*list|home|about|contact|privacy|terms|login|register|search|category|tag|archive|sitemap)\b/i;
 
       const DOWNLOAD_SIGNAL_RE = /\b(download|mirror|part\s*\d+|pkg|base|game|disc|iso|link|host)\b/i;
@@ -192,14 +361,12 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
 
         const text = (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim();
 
-        // --- Sinais estruturais ---
         const inNav = !!a.closest(
           'nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"]'
         );
         const inMenuLike = !!a.closest(
           '[class*="menu"], [class*="nav"], [class*="sidebar"], [class*="footer"], [class*="header"], [class*="breadcrumb"], [id*="menu"], [id*="nav"], [id*="sidebar"], [id*="footer"], [id*="header"]'
         );
-        // Área de conteúdo principal do post (Blogger / dlpsgame)
         const inContent = !!a.closest(
           'article, main, .entry-content, .post-content, .post-body, .content, .download, .links, .game-links, .download-links, .entry, .post'
         );
@@ -214,7 +381,6 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
           continue;
         }
 
-        // Contexto imediato curto
         const immediate = a.closest('li, td, th, p, span, div');
         let immediateText = '';
         if (immediate) {
@@ -235,11 +401,9 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         const isHostLabel = HOST_LABEL_RE.test(text);
         const hasDownloadText = DOWNLOAD_SIGNAL_RE.test(text);
         const hasDlcOrUpdate = DLC_SIGNAL_RE.test(text) || UPDATE_SIGNAL_RE.test(text);
-        // Texto do link cita um host conhecido (ex: "Mediafire", "1File", "Akia", "Viki")
         const textMentionsHost = DOWNLOAD_HOST_HINTS.some(h => text.toLowerCase().includes(h)) ||
           /akia|akira|viki|viking|1file/i.test(text);
 
-        // Sinal mínimo aceitável
         const strongSignal =
           isKnownFinalHost ||
           hasFileExt ||
@@ -254,7 +418,6 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
           continue;
         }
 
-        // Score
         let score = 0;
         if (isKnownFinalHost) score += 10;
         if (hasFileExt) score += 8;
@@ -267,7 +430,6 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
           score += 2;
         }
 
-        // Penaliza mesmos-domínio sem sinal de arquivo
         try {
           if (new URL(href).origin === location.origin && !hasFileExt && !isKnownFinalHost) {
             score -= 5;
@@ -304,6 +466,30 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
     console.log('[EXTRACT] diag:', JSON.stringify(diag));
     console.log('[EXTRACT] sample texts:', links.slice(0, 8).map(l => l.text));
 
+    // Resolve URLs intermediárias (com cache local nesta execução)
+    const resolutionCache = new Map();
+    let resolvedOk = 0;
+    let resolvedFail = 0;
+
+    for (const link of links) {
+      if (resolutionCache.has(link.href)) {
+        link.resolved = resolutionCache.get(link.href);
+        continue;
+      }
+
+      const resolution = await resolveLink(page, link.href);
+      resolutionCache.set(link.href, resolution);
+      link.resolved = resolution;
+
+      if (resolution.success) {
+        resolvedOk++;
+      } else {
+        resolvedFail++;
+      }
+    }
+
+    console.log('[RESOLVE] ok=%d fail=%d unique=%d', resolvedOk, resolvedFail, resolutionCache.size);
+
     // Classifica usando principalmente o texto do próprio link
     const classified = {
       base: [],
@@ -322,10 +508,29 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
 
       if (NAV_TEXT_RE.test(text)) continue;
 
+      // Host final preferido: resolved.url se sucesso, senão o host original
+      const finalHost =
+        (link.resolved && link.resolved.success && link.resolved.host)
+          ? link.resolved.host
+          : link.host;
+
       const entry = {
         href: link.href,
         text: link.text,
-        host: link.host
+        host: finalHost,
+        originalUrl: link.href,
+        resolved: link.resolved
+          ? {
+              success: !!link.resolved.success,
+              url: link.resolved.success ? link.resolved.url : null,
+              error: link.resolved.success ? undefined : (link.resolved.error || 'Não resolvido'),
+              method: link.resolved.method || undefined
+            }
+          : {
+              success: false,
+              url: null,
+              error: 'Resolução não executada'
+            }
       };
 
       // Prioridade: sinais no próprio texto do <a>
@@ -381,7 +586,9 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         found: totalFound,
         base: classified.base.length,
         updates: classified.updates.length,
-        dlcs: classified.dlcs.length
+        dlcs: classified.dlcs.length,
+        resolved: resolvedOk,
+        failed: resolvedFail
       },
 
       timestamp: new Date().toISOString()
