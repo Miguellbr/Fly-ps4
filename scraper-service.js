@@ -128,16 +128,27 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
     const pageTitle = await page.title().catch(() => 'Unknown');
     const finalUrl = page.url();
 
-    // Extrai links com análise estrutural do DOM
-    const links = await page.evaluate(() => {
+    // Extrai links com análise estrutural + diagnóstico
+    const extractResult = await page.evaluate(() => {
+      const diag = {
+        totalAnchors: 0,
+        discardedNav: 0,
+        discardedNavText: 0,
+        discardedWeakSignal: 0,
+        discardedLowScore: 0,
+        passed: 0
+      };
+
       const results = [];
       const seen = new Set();
 
-      const DOWNLOAD_HOSTS = [
+      // Hosts finais conhecidos (aparecem no href OU no texto do link)
+      const DOWNLOAD_HOST_HINTS = [
         'mediafire',
         '1fichier',
         'mega.nz',
         'mega.co.nz',
+        'mega',
         'gofile',
         'pixeldrain',
         'qiwi',
@@ -145,18 +156,35 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         'mixdrop',
         'dropbox',
         'drive.google',
-        'googleusercontent'
+        'googleusercontent',
+        'akirabox',
+        'vikingfile',
+        'workupload'
       ];
 
-      // Texto do próprio link que indica navegação / listas gerais
+      // Encurtadores / intermediários usados pelo site (href real dos botões)
+      const INTERMEDIATE_HOSTS = [
+        'shrinkearn.com',
+        'shrinkme.io',
+        'linkvertise.com',
+        'ouo.io',
+        'adf.ly',
+        'bit.ly',
+        'cutt.ly'
+      ];
+
+      // Texto do link que é rótulo de host de download (comum no dlpsgame)
+      const HOST_LABEL_RE = /^(mediafire|1fichier|1file|mega|gofile|pixeldrain|akia|akira|akirabox|viki|viking|vikingfile|dropbox|drive|google\s*drive|qiwi|katfile|mixdrop|workupload|mirror\s*\d*|part\s*\d+|link\s*\d+)$/i;
+
+      // Texto de navegação / listas gerais → descartar
       const NAV_TEXT_RE = /\b(guide\s*download|tool\s*download|guide\s*download\s*game|daily\s*update|update\s*list\s*all\s*game|list\s*all\s*game|all\s*game\s*(ps[2345]|vita|psp)|ps[2345]\s*list|home|about|contact|privacy|terms|login|register|search|category|tag|archive|sitemap)\b/i;
 
-      // Sinais de download no texto do link (sem "update"/"dlc" genéricos sozinhos)
       const DOWNLOAD_SIGNAL_RE = /\b(download|mirror|part\s*\d+|pkg|base|game|disc|iso|link|host)\b/i;
       const DLC_SIGNAL_RE = /\b(dlc|downloadable\s*content|season\s*pass|expansion|add[- ]?on|bonus\s*pack|costume\s*pack|character\s*pack)\b/i;
       const UPDATE_SIGNAL_RE = /\b(update|patch|ver(?:sion)?\.?\s*\d|v\d+\.\d+)\b/i;
 
       const anchors = Array.from(document.querySelectorAll('a[href]'));
+      diag.totalAnchors = anchors.length;
 
       for (const a of anchors) {
         const href = a.href;
@@ -171,17 +199,22 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         const inMenuLike = !!a.closest(
           '[class*="menu"], [class*="nav"], [class*="sidebar"], [class*="footer"], [class*="header"], [class*="breadcrumb"], [id*="menu"], [id*="nav"], [id*="sidebar"], [id*="footer"], [id*="header"]'
         );
+        // Área de conteúdo principal do post (Blogger / dlpsgame)
         const inContent = !!a.closest(
-          'article, main, .entry-content, .post-content, .content, .download, .links, .game-links, .download-links, .entry, .post'
+          'article, main, .entry-content, .post-content, .post-body, .content, .download, .links, .game-links, .download-links, .entry, .post'
         );
 
-        // Descarta navegação estrutural
-        if (inNav || inMenuLike) continue;
+        if (inNav || inMenuLike) {
+          diag.discardedNav++;
+          continue;
+        }
 
-        // Descarta por texto claro de lista/menu
-        if (NAV_TEXT_RE.test(text)) continue;
+        if (NAV_TEXT_RE.test(text)) {
+          diag.discardedNavText++;
+          continue;
+        }
 
-        // Contexto imediato (curto) — não o article inteiro
+        // Contexto imediato curto
         const immediate = a.closest('li, td, th, p, span, div');
         let immediateText = '';
         if (immediate) {
@@ -196,33 +229,58 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
           continue;
         }
 
-        const isKnownHost = DOWNLOAD_HOSTS.some(h => host.includes(h));
+        const isKnownFinalHost = DOWNLOAD_HOST_HINTS.some(h => host.includes(h));
+        const isIntermediate = INTERMEDIATE_HOSTS.some(h => host.includes(h));
         const hasFileExt = /\.(pkg|zip|rar|7z)(?:$|[?#])/i.test(href);
+        const isHostLabel = HOST_LABEL_RE.test(text);
         const hasDownloadText = DOWNLOAD_SIGNAL_RE.test(text);
         const hasDlcOrUpdate = DLC_SIGNAL_RE.test(text) || UPDATE_SIGNAL_RE.test(text);
+        // Texto do link cita um host conhecido (ex: "Mediafire", "1File", "Akia", "Viki")
+        const textMentionsHost = DOWNLOAD_HOST_HINTS.some(h => text.toLowerCase().includes(h)) ||
+          /akia|akira|viki|viking|1file/i.test(text);
 
-        // Exige sinal forte: host conhecido OU extensão de arquivo OU texto de download/dlc/update no próprio link
-        if (!isKnownHost && !hasFileExt && !hasDownloadText && !hasDlcOrUpdate) continue;
+        // Sinal mínimo aceitável
+        const strongSignal =
+          isKnownFinalHost ||
+          hasFileExt ||
+          isHostLabel ||
+          textMentionsHost ||
+          (isIntermediate && (isHostLabel || textMentionsHost || hasDownloadText || hasDlcOrUpdate || inContent)) ||
+          hasDownloadText ||
+          hasDlcOrUpdate;
 
-        // Score simples para preferir área de conteúdo
+        if (!strongSignal) {
+          diag.discardedWeakSignal++;
+          continue;
+        }
+
+        // Score
         let score = 0;
-        if (isKnownHost) score += 8;
+        if (isKnownFinalHost) score += 10;
         if (hasFileExt) score += 8;
+        if (isHostLabel || textMentionsHost) score += 8;
+        if (isIntermediate && inContent) score += 6;
         if (hasDownloadText) score += 4;
         if (hasDlcOrUpdate) score += 3;
-        if (inContent) score += 3;
-        if (immediateText && DOWNLOAD_SIGNAL_RE.test(immediateText)) score += 1;
+        if (inContent) score += 4;
+        if (immediateText && (DOWNLOAD_SIGNAL_RE.test(immediateText) || /mediafire|1fichier|akira|viking|mega/i.test(immediateText))) {
+          score += 2;
+        }
 
-        // Penaliza mesmos-domínio genéricos (navegação interna)
+        // Penaliza mesmos-domínio sem sinal de arquivo
         try {
-          if (new URL(href).origin === location.origin && !hasFileExt && !isKnownHost) {
-            score -= 4;
+          if (new URL(href).origin === location.origin && !hasFileExt && !isKnownFinalHost) {
+            score -= 5;
           }
         } catch {}
 
-        if (score < 3) continue;
+        if (score < 3) {
+          diag.discardedLowScore++;
+          continue;
+        }
 
         seen.add(href);
+        diag.passed++;
         results.push({
           href,
           text: text.substring(0, 100),
@@ -233,10 +291,18 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
         });
       }
 
-      // Ordena por relevância
       results.sort((a, b) => b.score - a.score);
-      return results.slice(0, 60);
+      return {
+        links: results.slice(0, 60),
+        diag
+      };
     });
+
+    const links = extractResult.links || [];
+    const diag = extractResult.diag || {};
+
+    console.log('[EXTRACT] diag:', JSON.stringify(diag));
+    console.log('[EXTRACT] sample texts:', links.slice(0, 8).map(l => l.text));
 
     // Classifica usando principalmente o texto do próprio link
     const classified = {
@@ -254,7 +320,6 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
       const href = (link.href || '').toLowerCase();
       const immediate = (link.immediateText || '').toLowerCase();
 
-      // Segurança extra: se o texto ainda parecer navegação, pula
       if (NAV_TEXT_RE.test(text)) continue;
 
       const entry = {
@@ -270,14 +335,13 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
       }
 
       if (UPDATE_RE.test(text) || UPDATE_RE.test(href)) {
-        // Evita falso positivo de listas genéricas
         if (!/list\s*all|daily\s*update|guide|tool/i.test(text)) {
           classified.updates.push(entry);
           continue;
         }
       }
 
-      // Reforço opcional com contexto imediato curto
+      // Reforço com contexto imediato curto
       if (immediate.length > 0 && immediate.length < 120) {
         if (DLC_RE.test(immediate) && !/list\s*all|guide|tool/i.test(immediate)) {
           classified.dlcs.push(entry);
@@ -298,6 +362,8 @@ async function scrapeWithPuppeteer(url, titleId, gameName, attemptCaptcha) {
       classified.base.length +
       classified.updates.length +
       classified.dlcs.length;
+
+    console.log('[CLASSIFY] base=%d updates=%d dlcs=%d', classified.base.length, classified.updates.length, classified.dlcs.length);
 
     return {
       success: true,
