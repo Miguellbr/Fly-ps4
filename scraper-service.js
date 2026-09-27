@@ -613,16 +613,22 @@ async function scrapeWithPuppeteer(url, titleId, gameName, reqId) {
   const chromium = (await chromiumPromise).default;
 
   const browser = await puppeteerExtra.launch({
-    args: [
-      ...chromium.args,
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-      '--window-size=1920,1080'
-    ],
-    executablePath: await chromium.executablePath(),
-    headless: chromium.headless,
-    defaultViewport: { width: 1920, height: 1080 }
+  args: [
+    ...chromium.args,
+
+    // 👇 AQUI entraria um argumento adicional do Chromium
+    
+    
+
+'--proxy-server=http://user:pass@residential-proxy:port',
+    
+    '--no-sandbox',
+    '--disable-setuid-sandbox'
+  ],
+
+  executablePath: await chromium.executablePath(),
+  headless: chromium.headless
+});
   });
 
   try {
